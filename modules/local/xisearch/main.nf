@@ -25,11 +25,11 @@ process XISEARCH {
     script:
     def args = task.ext.args ?: ''
     def prefix = task.ext.prefix ?: "${meta.id}"
-    def mem = task.memory.toGiga()
+    def heap = task.ext.java_heap_gb ?: task.memory.toGiga()
     def peaks_ext = mode == 'linear' ? 'tsv' : 'csv'
     def xisearch_jar = task.ext.xisearch_jar ?: '/opt/xisearch/xiSEARCH.jar'
     """
-    java -Xmx${mem}g -jar ${xisearch_jar} \\
+    java -Xmx${heap}g -jar ${xisearch_jar} \\
         --fasta='${fasta}' \\
         --xiconf=UseCPUs:${task.cpus} \\
         --peaks='${spectra_file}' \\
