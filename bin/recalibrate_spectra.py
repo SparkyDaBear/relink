@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import NamedTuple
 
 import polars as pl
-from pyopenms import MSExperiment, MzMLFile
+from pyopenms import MzMLFile, PlainMSDataWritingConsumer
 
 
 class MassError(NamedTuple):
@@ -47,7 +47,8 @@ def calculate_mass_error(
     """
     # Load and filter xiSEARCH results
     xi_df = (
-        pl.read_csv(linear_results_path, infer_schema=False)
+        pl.scan_csv(linear_results_path, infer_schema=False)
+        .select("decoy", "match score", "Scan", "Run", "Precursor Error")
         .with_columns(pl.col("decoy").str.replace_all(",", "").cast(pl.Int64))
         .with_columns(pl.col("match score").str.replace_all(",", "").cast(pl.Float64))
         .filter((pl.col("decoy") == 0) & (pl.col("match score") > minimum_match_score))
@@ -56,16 +57,18 @@ def calculate_mass_error(
         .with_columns(
             pl.col("Precursor Error").str.replace_all(",", "").cast(pl.Float64)
         )
+        .collect(engine="streaming")
     )
 
-    # Load peaks data
+    # Scan only required peak columns; the unfiltered TSV can exceed node memory.
     peaks_df = (
-        pl.read_csv(
+        pl.scan_csv(
             peaks_path,
             separator="\t",
             truncate_ragged_lines=True,
             infer_schema=False,
         )
+        .select("CalcMZ", "MS2Error", "ScanNumber", "Run", "IsPrimaryMatch")
         .with_columns(pl.col("CalcMZ").str.replace_all(",", "").cast(pl.Float64))
         .with_columns(pl.col("MS2Error").str.replace_all(",", "").cast(pl.Float64))
         .with_columns(pl.col("ScanNumber").str.replace_all(",", "").cast(pl.Int64))
@@ -91,7 +94,7 @@ def calculate_mass_error(
     ms2_error_df = (
         peaks_df.filter(pl.col("IsPrimaryMatch") == 1)
         .join(
-            xi_df.select(pl.col("Scan", "Run", "decoy")),
+            xi_df.select(pl.col("Scan", "Run", "decoy")).lazy(),
             left_on=["ScanNumber", "Run"],
             right_on=["Scan", "Run"],
             how="inner",
@@ -103,6 +106,7 @@ def calculate_mass_error(
             & (pl.col("MS2Error_ppm") >= ms2_error_bounds[1])
         )
         .select(pl.col("MS2Error_ppm"))
+        .collect(engine="streaming")
     )
 
     ms2_error = ms2_error_df.median().item() if len(ms2_error_df) > 0 else 0.0
@@ -123,31 +127,36 @@ def recalibrate_spectra(
         output_path: Path to write recalibrated mzML
         mass_error: MassError with precursor and MS2 corrections in ppm
     """
-    exp = MSExperiment()
-    MzMLFile().load(str(spectra_path), exp)
+    writer = PlainMSDataWritingConsumer(str(output_path))
 
-    recalibrated_spectra = []
-    for spectrum in exp:
-        # Recalibrate precursor mass
-        precursors = spectrum.getPrecursors()
-        for precursor in precursors:
-            corrected_mz = precursor.getMZ() / (
-                1 + mass_error.precursor_error / 10.0**6
-            )
-            precursor.setMZ(corrected_mz)
-        spectrum.setPrecursors(precursors)
+    class RecalibrationConsumer:
+        def setExperimentalSettings(self, settings):
+            writer.setExperimentalSettings(settings)
 
-        # mzML contains both MS1 and MSn spectra; only apply the fragment-ion
-        # correction to fragmentation scans.
-        if spectrum.getMSLevel() > 1:
-            mz_array, intensity_array = spectrum.get_peaks()
-            corrected_mz_array = mz_array / (1 + mass_error.ms2_error / 10.0**6)
-            spectrum.set_peaks((corrected_mz_array, intensity_array))
+        def setExpectedSize(self, spectra, chromatograms):
+            writer.setExpectedSize(spectra, chromatograms)
 
-        recalibrated_spectra.append(spectrum)
+        def consumeSpectrum(self, spectrum):
+            precursors = spectrum.getPrecursors()
+            for precursor in precursors:
+                precursor.setMZ(
+                    precursor.getMZ() / (1 + mass_error.precursor_error / 10.0**6)
+                )
+            spectrum.setPrecursors(precursors)
+            if spectrum.getMSLevel() > 1:
+                mz_array, intensity_array = spectrum.get_peaks()
+                spectrum.set_peaks((
+                    mz_array / (1 + mass_error.ms2_error / 10.0**6),
+                    intensity_array,
+                ))
+            writer.consumeSpectrum(spectrum)
 
-    exp.setSpectra(recalibrated_spectra)
-    MzMLFile().store(str(output_path), exp)
+        def consumeChromatogram(self, chromatogram):
+            writer.consumeChromatogram(chromatogram)
+
+    MzMLFile().transform(str(spectra_path), RecalibrationConsumer())
+    # Finalize the mzML index and closing tags before returning.
+    del writer
 
 
 def generate_plots(
